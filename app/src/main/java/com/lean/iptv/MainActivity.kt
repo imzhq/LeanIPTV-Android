@@ -1,8 +1,12 @@
 package com.lean.iptv
 
+import android.Manifest
 import android.app.PictureInPictureParams
 import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageManager
 import android.content.res.Configuration
+import android.os.Build
 import android.os.Bundle
 import android.util.Rational
 import androidx.activity.ComponentActivity
@@ -10,6 +14,7 @@ import androidx.activity.SystemBarStyle
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
@@ -26,11 +31,15 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.lifecycle.Lifecycle
 import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
 
     var inPip by mutableStateOf(false)
+
+    private val notificationPermission =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -38,6 +47,14 @@ class MainActivity : ComponentActivity() {
             statusBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
             navigationBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT)
         )
+
+        // Android 13+ asks before an app may show the "Playing" notification
+        if (Build.VERSION.SDK_INT >= 33 &&
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) {
+            notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+
         setContent { App(this) }
     }
 
@@ -53,7 +70,8 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    // Pressing Home while a video is open floats it in a small window
+    // Pressing Home while a video is open floats it in a small window.
+    // Locking the phone does not call this, so the video keeps playing then.
     override fun onUserLeaveHint() {
         super.onUserLeaveHint()
         if (PlayerHolder.player != null) enterPip()
@@ -65,12 +83,12 @@ class MainActivity : ComponentActivity() {
     ) {
         super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig)
         inPip = isInPictureInPictureMode
-    }
 
-    // Also runs when the little PiP window is closed, so the video stops
-    override fun onStop() {
-        super.onStop()
-        PlayerHolder.player?.pause()
+        // If the little window was closed with its X, stop the video
+        if (!isInPictureInPictureMode && lifecycle.currentState == Lifecycle.State.CREATED) {
+            PlayerHolder.player?.pause()
+            stopService(Intent(this, PlaybackService::class.java))
+        }
     }
 }
 
