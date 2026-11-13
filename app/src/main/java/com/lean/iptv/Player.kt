@@ -2,6 +2,7 @@ package com.lean.iptv
 
 import android.app.Activity
 import android.content.Context
+import android.content.Intent
 import android.view.WindowManager
 import androidx.annotation.OptIn
 import androidx.compose.foundation.background
@@ -43,7 +44,7 @@ import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
 
-// Lets the activity pause the video and float it when you press Home
+// Lets the activity and the background service reach the current player
 object PlayerHolder {
     @Volatile
     var player: ExoPlayer? = null
@@ -87,6 +88,8 @@ private fun buildPlayer(context: Context, live: Boolean, liveMs: Int, movieSec: 
             true
         )
         .setHandleAudioBecomingNoisy(true)
+        // Keeps the processor and Wi-Fi awake while playing, so it works with the screen locked
+        .setWakeMode(C.WAKE_MODE_NETWORK)
         .build()
 }
 
@@ -131,6 +134,21 @@ fun PlayerScreen(
             player.removeListener(listener)
             if (PlayerHolder.player === player) PlayerHolder.player = null
             player.release()
+        }
+    }
+
+    // Background service: keeps playing with the screen locked, shows a "Playing" notification
+    DisposableEffect(Unit) {
+        try {
+            context.startForegroundService(
+                Intent(context, PlaybackService::class.java)
+                    .putExtra(PlaybackService.EXTRA_TITLE, title)
+            )
+        } catch (e: Exception) {
+            // The video still plays with the screen on if the service can't start
+        }
+        onDispose {
+            context.stopService(Intent(context, PlaybackService::class.java))
         }
     }
 
