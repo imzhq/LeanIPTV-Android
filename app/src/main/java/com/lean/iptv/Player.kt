@@ -1,8 +1,9 @@
 package com.lean.iptv
 
-import android.app.Activity 
+import android.app.Activity
 import android.content.Context
 import android.content.Intent
+import android.os.SystemClock
 import android.view.WindowManager
 import androidx.annotation.OptIn
 import androidx.compose.foundation.background
@@ -17,6 +18,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
@@ -41,8 +43,12 @@ import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
+import androidx.media3.exoplayer.source.MediaSource
+import androidx.media3.exoplayer.source.ProgressiveMediaSource
+import androidx.media3.extractor.DefaultExtractorsFactory
 import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
+import kotlinx.coroutines.delay
 
 // Lets the activity and the background service reach the current player
 object PlayerHolder {
@@ -50,15 +56,33 @@ object PlayerHolder {
     var player: ExoPlayer? = null
 }
 
-private val liveSteps = listOf(200, 500, 800, 1000, 1500, 2000, 3000, 5000)   // milliseconds
-private val movieSteps = listOf(10, 20, 30, 45, 60)                           // seconds
+private val liveSteps = listOf(100, 200, 300, 500, 800, 1000, 1500, 2000, 3000, 5000)   // milliseconds
+private val movieSteps = listOf(10, 20, 30, 45, 60)                                      // seconds
+
+// If live video stays stalled this long, reconnect so it jumps back to the live edge
+private const val AUTO_RECONNECT_MS = 4000L
+
+@OptIn(UnstableApi::class)
+private fun httpFactory(): DefaultHttpDataSource.Factory =
+    DefaultHttpDataSource.Factory()
+        .setUserAgent("Mozilla/5.0")
+        .setAllowCrossProtocolRedirects(true)
+        .setConnectTimeoutMs(15000)
+        .setReadTimeoutMs(15000)
+
+// Live source: checks the buffer every 32 KB instead of every 1 MB, so the buffer setting is accurate
+@OptIn(UnstableApi::class)
+private fun liveSource(url: String): MediaSource =
+    ProgressiveMediaSource.Factory(httpFactory(), DefaultExtractorsFactory())
+        .setContinueLoadingCheckIntervalBytes(32 * 1024)
+        .createMediaSource(MediaItem.fromUri(url))
 
 @OptIn(UnstableApi::class)
 private fun buildPlayer(context: Context, live: Boolean, liveMs: Int, movieSec: Int): ExoPlayer {
     val loadControl = if (live) {
         // Small buffer = small delay. Raise it if the picture stutters.
         DefaultLoadControl.Builder()
-            .setBufferDurationsMs(liveMs, liveMs * 3, liveMs, liveMs)
+            .setBufferDurationsMs(liveMs, liveMs * 2, liveMs, liveMs)
             .setPrioritizeTimeOverSizeThresholds(true)
             .build()
     } else {
@@ -71,14 +95,8 @@ private fun buildPlayer(context: Context, live: Boolean, liveMs: Int, movieSec: 
             .build()
     }
 
-    val http = DefaultHttpDataSource.Factory()
-        .setUserAgent("Mozilla/5.0")
-        .setAllowCrossProtocolRedirects(true)
-        .setConnectTimeoutMs(15000)
-        .setReadTimeoutMs(15000)
-
     return ExoPlayer.Builder(context)
-        .setMediaSourceFactory(DefaultMediaSourceFactory(http))
+        .setMediaSourceFactory(DefaultMediaSourceFactory(httpFactory()))
         .setLoadControl(loadControl)
         .setAudioAttributes(
             AudioAttributes.Builder()
@@ -105,17 +123,23 @@ fun PlayerScreen(
     val context = LocalContext.current
     val prefs = remember { context.getSharedPreferences("lean", Context.MODE_PRIVATE) }
 
-    var liveMs by remember { mutableIntStateOf(prefs.getInt("live_buf_ms", 1000)) }
+    // New saved name, so the new lower default applies even if you saved an older value
+    var liveMs by remember { mutableIntStateOf(prefs.getInt("live_buf_ms_v2", 500)) }
     var movieSec by remember { mutableIntStateOf(prefs.getInt("movie_buf_s", 20)) }
     var restart by remember { mutableIntStateOf(0) }
     var resumeMs by remember { mutableLongStateOf(0L) }
+    var stalledSince by remember { mutableLongStateOf(0L) }
     var errorText by remember { mutableStateOf<String?>(null) }
     var showLiveControls by remember { mutableStateOf(true) }
 
     val player = remember(url, liveMs, movieSec, restart) {
         val p = buildPlayer(context, live, liveMs, movieSec)
-        p.setMediaItem(MediaItem.fromUri(url))
-        if (!live && resumeMs > 0) p.seekTo(resumeMs)
+        if (live) {
+            p.setMediaSource(liveSource(url))
+        } else {
+            p.setMediaItem(MediaItem.fromUri(url))
+            if (resumeMs > 0) p.seekTo(resumeMs)
+        }
         p.prepare()
         p.playWhenReady = true
         p
@@ -123,10 +147,20 @@ fun PlayerScreen(
 
     DisposableEffect(player) {
         errorText = null
+        stalledSince = 0L
         PlayerHolder.player = player
+        var hasPlayed = false
         val listener = object : Player.Listener {
             override fun onPlayerError(error: PlaybackException) {
                 errorText = "${error.errorCodeName}: ${error.message ?: ""}"
+            }
+
+            override fun onPlaybackStateChanged(playbackState: Int) {
+                if (playbackState == Player.STATE_READY) hasPlayed = true
+                // Remember when a stall started (only after playback had begun)
+                stalledSince =
+                    if (playbackState == Player.STATE_BUFFERING && hasPlayed) SystemClock.elapsedRealtime()
+                    else 0L
             }
         }
         player.addListener(listener)
@@ -134,6 +168,20 @@ fun PlayerScreen(
             player.removeListener(listener)
             if (PlayerHolder.player === player) PlayerHolder.player = null
             player.release()
+        }
+    }
+
+    // Live only: if a stall goes on too long, restart the stream to jump back to the live edge
+    LaunchedEffect(player) {
+        if (live) {
+            while (true) {
+                delay(500)
+                val since = stalledSince
+                if (since > 0L && SystemClock.elapsedRealtime() - since > AUTO_RECONNECT_MS) {
+                    stalledSince = 0L
+                    restart++
+                }
+            }
         }
     }
 
@@ -163,7 +211,7 @@ fun PlayerScreen(
         val found = liveSteps.indexOfFirst { it >= liveMs }
         val idx = if (found < 0) liveSteps.lastIndex else found
         liveMs = liveSteps[(idx + dir).coerceIn(0, liveSteps.lastIndex)]
-        prefs.edit().putInt("live_buf_ms", liveMs).apply()
+        prefs.edit().putInt("live_buf_ms_v2", liveMs).apply()
     }
 
     fun stepMovie(dir: Int) {
