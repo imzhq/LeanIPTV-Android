@@ -40,6 +40,7 @@ import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.DefaultHttpDataSource
+import androidx.media3.datasource.HttpDataSource
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
@@ -56,11 +57,9 @@ object PlayerHolder {
     var player: ExoPlayer? = null
 }
 
-private val liveSteps = listOf(100, 200, 300, 500, 800, 1000, 1500, 2000, 3000, 5000)   // milliseconds
-private val movieSteps = listOf(10, 20, 30, 45, 60)                                      // seconds
-
-// If live video stays stalled this long, reconnect so it jumps back to the live edge
-private const val AUTO_RECONNECT_MS = 4000L
+// 0.1 s was too small for the picture to hold together, so the lowest step is now 0.3 s
+private val liveSteps = listOf(300, 500, 800, 1200, 2000, 3000, 5000)   // milliseconds
+private val movieSteps = listOf(10, 20, 30, 45, 60)                     // seconds
 
 @OptIn(UnstableApi::class)
 private fun httpFactory(): DefaultHttpDataSource.Factory =
@@ -123,13 +122,17 @@ fun PlayerScreen(
     val context = LocalContext.current
     val prefs = remember { context.getSharedPreferences("lean", Context.MODE_PRIVATE) }
 
-    // New saved name, so the new lower default applies even if you saved an older value
-    var liveMs by remember { mutableIntStateOf(prefs.getInt("live_buf_ms_v2", 500)) }
+    // New saved name, so the new default applies even if you saved 0.1 s before
+    var liveMs by remember { mutableIntStateOf(prefs.getInt("live_buf_ms_v3", 800)) }
     var movieSec by remember { mutableIntStateOf(prefs.getInt("movie_buf_s", 20)) }
     var restart by remember { mutableIntStateOf(0) }
     var resumeMs by remember { mutableLongStateOf(0L) }
     var stalledSince by remember { mutableLongStateOf(0L) }
+    var lastAutoReconnect by remember { mutableLongStateOf(0L) }
+    var errorStamp by remember { mutableLongStateOf(0L) }
+    var retryCount by remember { mutableIntStateOf(0) }
     var errorText by remember { mutableStateOf<String?>(null) }
+    var liveInfo by remember { mutableStateOf("") }
     var showLiveControls by remember { mutableStateOf(true) }
 
     val player = remember(url, liveMs, movieSec, restart) {
@@ -152,11 +155,21 @@ fun PlayerScreen(
         var hasPlayed = false
         val listener = object : Player.Listener {
             override fun onPlayerError(error: PlaybackException) {
-                errorText = "${error.errorCodeName}: ${error.message ?: ""}"
+                // Show the real status code the server sent back, if there was one
+                val http = error.cause as? HttpDataSource.InvalidResponseCodeException
+                errorText = if (http != null) {
+                    "The server answered with HTTP ${http.responseCode}"
+                } else {
+                    "${error.errorCodeName}: ${error.message ?: ""}"
+                }
+                errorStamp = SystemClock.elapsedRealtime()
             }
 
             override fun onPlaybackStateChanged(playbackState: Int) {
-                if (playbackState == Player.STATE_READY) hasPlayed = true
+                if (playbackState == Player.STATE_READY) {
+                    hasPlayed = true
+                    retryCount = 0
+                }
                 // Remember when a stall started (only after playback had begun)
                 stalledSince =
                     if (playbackState == Player.STATE_BUFFERING && hasPlayed) SystemClock.elapsedRealtime()
@@ -171,17 +184,59 @@ fun PlayerScreen(
         }
     }
 
-    // Live only: if a stall goes on too long, restart the stream to jump back to the live edge
+    // Live only: catch-up. When extra video has piled up beyond the chosen buffer,
+    // play a little faster until the delay is back down. No pausing, no seeking.
+    LaunchedEffect(player, liveMs) {
+        if (live) {
+            var lastSpeed = 1f
+            while (true) {
+                delay(300)
+                val ready = player.playbackState == Player.STATE_READY && player.playWhenReady
+                var want = 1f
+                if (ready) {
+                    val excess = player.totalBufferedDuration - liveMs
+                    want = when {
+                        excess > 2500 -> 1.3f
+                        excess > 1200 -> 1.15f
+                        excess > 600 -> 1.05f
+                        else -> 1f
+                    }
+                }
+                if (want != lastSpeed) {
+                    player.setPlaybackSpeed(want)
+                    lastSpeed = want
+                }
+                liveInfo = String.format(
+                    "Buffered %.1f s  |  speed %.2fx",
+                    player.totalBufferedDuration / 1000.0,
+                    lastSpeed
+                )
+            }
+        }
+    }
+
+    // Live only: if the video stays frozen a long time, reconnect (at most once every 15 seconds)
     LaunchedEffect(player) {
         if (live) {
             while (true) {
                 delay(500)
+                val now = SystemClock.elapsedRealtime()
                 val since = stalledSince
-                if (since > 0L && SystemClock.elapsedRealtime() - since > AUTO_RECONNECT_MS) {
+                if (since > 0L && now - since > 6000L && now - lastAutoReconnect > 15000L) {
+                    lastAutoReconnect = now
                     stalledSince = 0L
                     restart++
                 }
             }
+        }
+    }
+
+    // Live only: after an error, wait 3 seconds and try again (up to 3 times in a row)
+    LaunchedEffect(errorStamp) {
+        if (live && errorStamp != 0L && retryCount < 3) {
+            delay(3000)
+            retryCount++
+            restart++
         }
     }
 
@@ -211,7 +266,7 @@ fun PlayerScreen(
         val found = liveSteps.indexOfFirst { it >= liveMs }
         val idx = if (found < 0) liveSteps.lastIndex else found
         liveMs = liveSteps[(idx + dir).coerceIn(0, liveSteps.lastIndex)]
-        prefs.edit().putInt("live_buf_ms_v2", liveMs).apply()
+        prefs.edit().putInt("live_buf_ms_v3", liveMs).apply()
     }
 
     fun stepMovie(dir: Int) {
@@ -248,7 +303,8 @@ fun PlayerScreen(
             )
         }
 
-        if (!inPip && (!live || showLiveControls)) {
+        // Title bar: live TV only, movies keep a clean picture
+        if (live && !inPip && showLiveControls) {
             Column(
                 Modifier
                     .align(Alignment.TopCenter)
@@ -259,17 +315,6 @@ fun PlayerScreen(
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text(title, color = Color.White, maxLines = 1, modifier = Modifier.weight(1f))
                     TextButton(onClick = onEnterPip) { Text("PiP", color = Color.White) }
-                }
-                if (!live) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        TextButton(onClick = { stepMovie(-1) }) {
-                            Text("Less buffer", color = Color.White)
-                        }
-                        Text("Buffer: $movieSec s", color = Color.White, fontSize = 12.sp)
-                        TextButton(onClick = { stepMovie(1) }) {
-                            Text("More buffer", color = Color.White)
-                        }
-                    }
                 }
             }
         }
@@ -288,6 +333,7 @@ fun PlayerScreen(
                     color = Color.White,
                     fontSize = 13.sp
                 )
+                Text(liveInfo, color = Color.Yellow, fontSize = 11.sp)
                 Row {
                     TextButton(onClick = { stepLive(-1) }) { Text("Lower delay", color = Color.White) }
                     TextButton(onClick = { stepLive(1) }) { Text("More stable", color = Color.White) }
