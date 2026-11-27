@@ -8,6 +8,7 @@ import android.net.wifi.WifiManager
 import android.os.PowerManager
 import android.os.SystemClock
 import android.view.WindowManager
+import androidx.activity.ComponentActivity
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Box
@@ -38,6 +39,8 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
@@ -57,7 +60,9 @@ object PlayerHolder {
 }
 
 private val liveSteps = listOf(300, 500, 800, 1200, 2000, 3000, 5000)   // milliseconds
-private val movieSteps = listOf(10, 20, 30, 45, 60)                     // seconds
+
+// Seconds of video kept downloaded for movies and series. A bigger number plays smoother on a slow connection.
+private const val MOVIE_BUFFER_S = 20
 
 private fun clock(ms: Long): String {
     val s = maxOf(ms, 0L) / 1000
@@ -65,6 +70,12 @@ private fun clock(ms: Long): String {
     val m = (s % 3600) / 60
     val sec = s % 60
     return if (h > 0) String.format("%d:%02d:%02d", h, m, sec) else String.format("%d:%02d", m, sec)
+}
+
+// Remembers the video view and whether the player is currently attached to it
+private class ViewState {
+    var layout: VLCVideoLayout? = null
+    var attached = false
 }
 
 // One VLC player for the whole screen. Reconnecting reuses it, so the old connection closes first.
@@ -139,9 +150,9 @@ fun PlayerScreen(
     val context = LocalContext.current
     val prefs = remember { context.getSharedPreferences("lean", Context.MODE_PRIVATE) }
     val session = remember { VlcSession(context) }
+    val viewState = remember { ViewState() }
 
     var liveMs by remember { mutableIntStateOf(prefs.getInt("live_buf_ms_v4", 500)) }
-    var movieSec by remember { mutableIntStateOf(prefs.getInt("movie_buf_s", 20)) }
     var restartKey by remember { mutableIntStateOf(0) }
     var resumeMs by remember { mutableLongStateOf(0L) }
     var hasPlayed by remember { mutableStateOf(false) }
@@ -197,6 +208,42 @@ fun PlayerScreen(
         }
     }
 
+    // Fixes the black picture after locking the phone: let go of the video view when the screen
+    // stops (the sound keeps playing), and attach it again when the app comes back
+    DisposableEffect(session) {
+        val owner = context as? ComponentActivity
+        val observer = LifecycleEventObserver { _, event ->
+            if (!session.released) {
+                when (event) {
+                    Lifecycle.Event.ON_STOP -> {
+                        if (viewState.attached) {
+                            try {
+                                session.mediaPlayer.detachViews()
+                            } catch (e: Exception) {
+                                // ignore
+                            }
+                            viewState.attached = false
+                        }
+                    }
+                    Lifecycle.Event.ON_START -> {
+                        val layout = viewState.layout
+                        if (layout != null && !viewState.attached) {
+                            try {
+                                session.mediaPlayer.attachViews(layout, null, false, false)
+                                viewState.attached = true
+                            } catch (e: Exception) {
+                                // ignore
+                            }
+                        }
+                    }
+                    else -> {}
+                }
+            }
+        }
+        owner?.lifecycle?.addObserver(observer)
+        onDispose { owner?.lifecycle?.removeObserver(observer) }
+    }
+
     // Starts playback, and restarts it whenever restartKey changes (reconnect, buffer change, recovery)
     LaunchedEffect(restartKey) {
         if (restartKey > 0) {
@@ -211,7 +258,7 @@ fun PlayerScreen(
         }
         if (session.released) return@LaunchedEffect
         hasPlayed = false
-        val bufferMs = if (live) liveMs else movieSec * 1000
+        val bufferMs = if (live) liveMs else MOVIE_BUFFER_S * 1000
         val startSec = if (live) 0 else (resumeMs / 1000).toInt()
         session.start(url, live, bufferMs, startSec)
     }
@@ -331,20 +378,6 @@ fun PlayerScreen(
         restartKey++
     }
 
-    fun stepMovie(dir: Int) {
-        try {
-            resumeMs = maxOf(session.mediaPlayer.time, 0L)   // carry on from the same spot
-        } catch (e: Exception) {
-            // ignore
-        }
-        val found = movieSteps.indexOfFirst { it >= movieSec }
-        val idx = if (found < 0) movieSteps.lastIndex else found
-        movieSec = movieSteps[(idx + dir).coerceIn(0, movieSteps.lastIndex)]
-        prefs.edit().putInt("movie_buf_s", movieSec).apply()
-        errorCount = 0
-        restartKey++
-    }
-
     fun reconnect() {
         errorCount = 0
         if (!live) {
@@ -380,7 +413,9 @@ fun PlayerScreen(
         AndroidView(
             factory = { ctx ->
                 VLCVideoLayout(ctx).also { layout ->
+                    viewState.layout = layout
                     session.mediaPlayer.attachViews(layout, null, false, false)
+                    viewState.attached = true
                 }
             },
             modifier = Modifier.fillMaxSize()
@@ -461,7 +496,7 @@ fun PlayerScreen(
             }
         }
 
-        // Movies and series: seek bar and buttons, no banner over the picture
+        // Movies and series: seek bar and buttons, no buffer controls, no banner over the picture
         if (!live && !inPip && showControls) {
             Column(
                 Modifier
@@ -471,12 +506,6 @@ fun PlayerScreen(
                     .padding(8.dp),
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    TextButton(onClick = { touch(); stepMovie(-1) }) { Text("Less buffer", color = Color.White) }
-                    Text("Buffer: $movieSec s", color = Color.White, fontSize = 12.sp)
-                    TextButton(onClick = { touch(); stepMovie(1) }) { Text("More buffer", color = Color.White) }
-                    TextButton(onClick = { touch(); onEnterPip() }) { Text("PiP", color = Color.White) }
-                }
                 Slider(
                     value = progress.coerceIn(0f, 1f),
                     onValueChange = {
@@ -499,6 +528,7 @@ fun PlayerScreen(
                         Text(if (playing) "Pause" else "Play", color = Color.White)
                     }
                     TextButton(onClick = { touch(); seekBy(30_000L) }) { Text("+30 s", color = Color.White) }
+                    TextButton(onClick = { touch(); onEnterPip() }) { Text("PiP", color = Color.White) }
                 }
             }
         }
