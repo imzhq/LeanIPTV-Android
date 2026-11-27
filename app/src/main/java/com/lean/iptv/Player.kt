@@ -3,9 +3,11 @@ package com.lean.iptv
 import android.app.Activity
 import android.content.Context
 import android.content.Intent
+import android.net.Uri
+import android.net.wifi.WifiManager
+import android.os.PowerManager
 import android.os.SystemClock
 import android.view.WindowManager
-import androidx.annotation.OptIn
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Box
@@ -14,12 +16,15 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.Slider
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -33,84 +38,96 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
-import androidx.media3.common.AudioAttributes
-import androidx.media3.common.C
-import androidx.media3.common.MediaItem
-import androidx.media3.common.PlaybackException
-import androidx.media3.common.Player
-import androidx.media3.common.util.UnstableApi
-import androidx.media3.datasource.DefaultHttpDataSource
-import androidx.media3.datasource.HttpDataSource
-import androidx.media3.exoplayer.DefaultLoadControl
-import androidx.media3.exoplayer.ExoPlayer
-import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
-import androidx.media3.exoplayer.source.MediaSource
-import androidx.media3.exoplayer.source.ProgressiveMediaSource
-import androidx.media3.extractor.DefaultExtractorsFactory
-import androidx.media3.ui.AspectRatioFrameLayout
-import androidx.media3.ui.PlayerView
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
+import org.videolan.libvlc.LibVLC
+import org.videolan.libvlc.Media
+import org.videolan.libvlc.MediaPlayer
+import org.videolan.libvlc.util.VLCVideoLayout
 
-// Lets the activity and the background service reach the current player
-object PlayerHolder {
-    @Volatile
-    var player: ExoPlayer? = null
+// Lets the activity and the background service pause whatever is playing
+interface PlayerControl {
+    fun pause()
 }
 
-// 0.1 s was too small for the picture to hold together, so the lowest step is now 0.3 s
+object PlayerHolder {
+    @Volatile
+    var player: PlayerControl? = null
+}
+
 private val liveSteps = listOf(300, 500, 800, 1200, 2000, 3000, 5000)   // milliseconds
 private val movieSteps = listOf(10, 20, 30, 45, 60)                     // seconds
 
-@OptIn(UnstableApi::class)
-private fun httpFactory(): DefaultHttpDataSource.Factory =
-    DefaultHttpDataSource.Factory()
-        .setUserAgent("Mozilla/5.0")
-        .setAllowCrossProtocolRedirects(true)
-        .setConnectTimeoutMs(15000)
-        .setReadTimeoutMs(15000)
-
-// Live source: checks the buffer every 32 KB instead of every 1 MB, so the buffer setting is accurate
-@OptIn(UnstableApi::class)
-private fun liveSource(url: String): MediaSource =
-    ProgressiveMediaSource.Factory(httpFactory(), DefaultExtractorsFactory())
-        .setContinueLoadingCheckIntervalBytes(32 * 1024)
-        .createMediaSource(MediaItem.fromUri(url))
-
-@OptIn(UnstableApi::class)
-private fun buildPlayer(context: Context, live: Boolean, liveMs: Int, movieSec: Int): ExoPlayer {
-    val loadControl = if (live) {
-        // Small buffer = small delay. Raise it if the picture stutters.
-        DefaultLoadControl.Builder()
-            .setBufferDurationsMs(liveMs, liveMs * 2, liveMs, liveMs)
-            .setPrioritizeTimeOverSizeThresholds(true)
-            .build()
-    } else {
-        // Big buffer = smooth playback on a slow connection.
-        // Starts after 5 s are ready, and after a stall waits until 10 s are ready.
-        val bufMs = movieSec * 1000
-        DefaultLoadControl.Builder()
-            .setBufferDurationsMs(bufMs, bufMs + 10_000, 5_000, 10_000)
-            .setPrioritizeTimeOverSizeThresholds(true)
-            .build()
-    }
-
-    return ExoPlayer.Builder(context)
-        .setMediaSourceFactory(DefaultMediaSourceFactory(httpFactory()))
-        .setLoadControl(loadControl)
-        .setAudioAttributes(
-            AudioAttributes.Builder()
-                .setUsage(C.USAGE_MEDIA)
-                .setContentType(C.AUDIO_CONTENT_TYPE_MOVIE)
-                .build(),
-            true
-        )
-        .setHandleAudioBecomingNoisy(true)
-        // Keeps the processor and Wi-Fi awake while playing, so it works with the screen locked
-        .setWakeMode(C.WAKE_MODE_NETWORK)
-        .build()
+private fun clock(ms: Long): String {
+    val s = maxOf(ms, 0L) / 1000
+    val h = s / 3600
+    val m = (s % 3600) / 60
+    val sec = s % 60
+    return if (h > 0) String.format("%d:%02d:%02d", h, m, sec) else String.format("%d:%02d", m, sec)
 }
 
-@OptIn(UnstableApi::class)
+// One VLC player for the whole screen. Reconnecting reuses it, so the old connection closes first.
+private class VlcSession(context: Context) : PlayerControl {
+    val libVlc = LibVLC(context.applicationContext, arrayListOf("--http-reconnect"))
+    val mediaPlayer = MediaPlayer(libVlc)
+
+    @Volatile
+    var userPaused = false
+
+    @Volatile
+    var released = false
+
+    override fun pause() {
+        userPaused = true
+        try {
+            mediaPlayer.pause()
+        } catch (e: Exception) {
+            // already released
+        }
+    }
+
+    fun start(url: String, live: Boolean, bufferMs: Int, startSec: Int) {
+        userPaused = false
+        val media = Media(libVlc, Uri.parse(url))
+        media.addOption(":network-caching=$bufferMs")
+        if (live) {
+            // Small buffer = small delay
+            media.addOption(":live-caching=$bufferMs")
+            media.addOption(":clock-jitter=0")
+            media.addOption(":clock-synchro=0")
+        } else {
+            media.addOption(":file-caching=$bufferMs")
+            if (startSec > 0) media.addOption(":start-time=$startSec")
+        }
+        media.addOption(":http-reconnect")
+        mediaPlayer.media = media
+        media.release()
+        mediaPlayer.play()
+    }
+
+    fun release() {
+        if (released) return
+        released = true
+        try {
+            mediaPlayer.setEventListener(null)
+            mediaPlayer.detachViews()
+        } catch (e: Exception) {
+            // ignore
+        }
+        // Stopping a network stream can take a moment, so do it off the main thread
+        Thread {
+            try {
+                mediaPlayer.stop()
+                mediaPlayer.release()
+                libVlc.release()
+            } catch (e: Exception) {
+                // ignore
+            }
+        }.start()
+    }
+}
+
 @Composable
 fun PlayerScreen(
     title: String,
@@ -121,122 +138,147 @@ fun PlayerScreen(
 ) {
     val context = LocalContext.current
     val prefs = remember { context.getSharedPreferences("lean", Context.MODE_PRIVATE) }
+    val session = remember { VlcSession(context) }
 
-    // New saved name, so the new default applies even if you saved 0.1 s before
-    var liveMs by remember { mutableIntStateOf(prefs.getInt("live_buf_ms_v3", 800)) }
+    var liveMs by remember { mutableIntStateOf(prefs.getInt("live_buf_ms_v4", 500)) }
     var movieSec by remember { mutableIntStateOf(prefs.getInt("movie_buf_s", 20)) }
-    var restart by remember { mutableIntStateOf(0) }
+    var restartKey by remember { mutableIntStateOf(0) }
     var resumeMs by remember { mutableLongStateOf(0L) }
-    var stalledSince by remember { mutableLongStateOf(0L) }
-    var lastAutoReconnect by remember { mutableLongStateOf(0L) }
+    var hasPlayed by remember { mutableStateOf(false) }
+    var bufferingPct by remember { mutableFloatStateOf(100f) }
+    var lastBufferEvent by remember { mutableLongStateOf(0L) }
     var errorStamp by remember { mutableLongStateOf(0L) }
-    var retryCount by remember { mutableIntStateOf(0) }
-    var errorText by remember { mutableStateOf<String?>(null) }
-    var liveInfo by remember { mutableStateOf("") }
-    var showLiveControls by remember { mutableStateOf(true) }
+    var errorCount by remember { mutableIntStateOf(0) }
+    var status by remember { mutableStateOf("") }
+    var showControls by remember { mutableStateOf(true) }
+    var touchStamp by remember { mutableIntStateOf(0) }
+    var playing by remember { mutableStateOf(false) }
+    var timeMs by remember { mutableLongStateOf(0L) }
+    var lengthMs by remember { mutableLongStateOf(0L) }
+    var progress by remember { mutableFloatStateOf(0f) }
+    var scrubbing by remember { mutableStateOf(false) }
 
-    val player = remember(url, liveMs, movieSec, restart) {
-        val p = buildPlayer(context, live, liveMs, movieSec)
-        if (live) {
-            p.setMediaSource(liveSource(url))
-        } else {
-            p.setMediaItem(MediaItem.fromUri(url))
-            if (resumeMs > 0) p.seekTo(resumeMs)
-        }
-        p.prepare()
-        p.playWhenReady = true
-        p
+    fun touch() {
+        touchStamp++
+        showControls = true
     }
 
-    DisposableEffect(player) {
-        errorText = null
-        stalledSince = 0L
-        PlayerHolder.player = player
-        var hasPlayed = false
-        val listener = object : Player.Listener {
-            override fun onPlayerError(error: PlaybackException) {
-                // Show the real status code the server sent back, if there was one
-                val http = error.cause as? HttpDataSource.InvalidResponseCodeException
-                errorText = if (http != null) {
-                    "The server answered with HTTP ${http.responseCode}"
-                } else {
-                    "${error.errorCodeName}: ${error.message ?: ""}"
-                }
-                errorStamp = SystemClock.elapsedRealtime()
-            }
-
-            override fun onPlaybackStateChanged(playbackState: Int) {
-                if (playbackState == Player.STATE_READY) {
+    // Player events: playing, buffering, errors
+    DisposableEffect(session) {
+        PlayerHolder.player = session
+        session.mediaPlayer.setEventListener { event ->
+            when (event.type) {
+                MediaPlayer.Event.Playing -> {
                     hasPlayed = true
-                    retryCount = 0
+                    errorCount = 0
+                    errorStamp = 0L
+                    status = ""
                 }
-                // Remember when a stall started (only after playback had begun)
-                stalledSince =
-                    if (playbackState == Player.STATE_BUFFERING && hasPlayed) SystemClock.elapsedRealtime()
-                    else 0L
-            }
-        }
-        player.addListener(listener)
-        onDispose {
-            player.removeListener(listener)
-            if (PlayerHolder.player === player) PlayerHolder.player = null
-            player.release()
-        }
-    }
-
-    // Live only: catch-up. When extra video has piled up beyond the chosen buffer,
-    // play a little faster until the delay is back down. No pausing, no seeking.
-    LaunchedEffect(player, liveMs) {
-        if (live) {
-            var lastSpeed = 1f
-            while (true) {
-                delay(300)
-                val ready = player.playbackState == Player.STATE_READY && player.playWhenReady
-                var want = 1f
-                if (ready) {
-                    val excess = player.totalBufferedDuration - liveMs
-                    want = when {
-                        excess > 2500 -> 1.3f
-                        excess > 1200 -> 1.15f
-                        excess > 600 -> 1.05f
-                        else -> 1f
+                MediaPlayer.Event.Buffering -> {
+                    bufferingPct = event.buffering
+                    lastBufferEvent = SystemClock.elapsedRealtime()
+                }
+                MediaPlayer.Event.EncounteredError -> {
+                    status = "Playback error"
+                    errorStamp = SystemClock.elapsedRealtime()
+                }
+                MediaPlayer.Event.EndReached -> {
+                    if (live) {
+                        status = "Stream ended"
+                        errorStamp = SystemClock.elapsedRealtime()
                     }
                 }
-                if (want != lastSpeed) {
-                    player.setPlaybackSpeed(want)
-                    lastSpeed = want
-                }
-                liveInfo = String.format(
-                    "Buffered %.1f s  |  speed %.2fx",
-                    player.totalBufferedDuration / 1000.0,
-                    lastSpeed
-                )
+                else -> {}
             }
+        }
+        onDispose {
+            if (PlayerHolder.player === session) PlayerHolder.player = null
+            session.release()
         }
     }
 
-    // Live only: if the video stays frozen a long time, reconnect (at most once every 15 seconds)
-    LaunchedEffect(player) {
-        if (live) {
-            while (true) {
-                delay(500)
-                val now = SystemClock.elapsedRealtime()
-                val since = stalledSince
-                if (since > 0L && now - since > 6000L && now - lastAutoReconnect > 15000L) {
-                    lastAutoReconnect = now
-                    stalledSince = 0L
-                    restart++
+    // Starts playback, and restarts it whenever restartKey changes (reconnect, buffer change, recovery)
+    LaunchedEffect(restartKey) {
+        if (restartKey > 0) {
+            withContext(Dispatchers.IO) {
+                try {
+                    session.mediaPlayer.stop()
+                } catch (e: Exception) {
+                    // ignore
                 }
             }
+            delay(600)   // let the old connection close before opening a new one
         }
+        if (session.released) return@LaunchedEffect
+        hasPlayed = false
+        val bufferMs = if (live) liveMs else movieSec * 1000
+        val startSec = if (live) 0 else (resumeMs / 1000).toInt()
+        session.start(url, live, bufferMs, startSec)
     }
 
-    // Live only: after an error, wait 3 seconds and try again (up to 3 times in a row)
+    // After an error, wait 3 seconds and try again (up to 5 times in a row)
     LaunchedEffect(errorStamp) {
-        if (live && errorStamp != 0L && retryCount < 3) {
-            delay(3000)
-            retryCount++
-            restart++
+        if (errorStamp != 0L) {
+            if (errorCount < 5) {
+                delay(3000)
+                errorCount++
+                if (!live) {
+                    try {
+                        val t = session.mediaPlayer.time
+                        if (t > 0) resumeMs = t
+                    } catch (e: Exception) {
+                        // ignore
+                    }
+                }
+                restartKey++
+            } else {
+                status = "Playback failed. Try Reconnect, and check that no other device is using the account."
+            }
+        }
+    }
+
+    // Watchdog and screen state: if the picture stops moving for a while, restart it
+    LaunchedEffect(session) {
+        var lastTime = -1L
+        var lastMove = SystemClock.elapsedRealtime()
+        var lastRecover = 0L
+        while (true) {
+            delay(500)
+            if (session.released) break
+            try {
+                val mp = session.mediaPlayer
+                val now = SystemClock.elapsedRealtime()
+                val t = mp.time
+                playing = mp.isPlaying
+                timeMs = t
+                lengthMs = mp.length
+                if (!scrubbing && lengthMs > 0) progress = mp.position
+                if (t != lastTime) {
+                    lastTime = t
+                    lastMove = now
+                }
+
+                // Buffering messages count as signs of life, so a slow download is not treated as dead
+                val lastSign = maxOf(lastMove, lastBufferEvent)
+                val limit = if (hasPlayed) 10_000L else 60_000L
+                val atEnd = !live && lengthMs > 0 && t >= lengthMs - 2000
+                if (!session.userPaused && !atEnd && now - lastSign > limit && now - lastRecover > 15_000L) {
+                    lastRecover = now
+                    lastMove = now
+                    if (!live && t > 0) resumeMs = t
+                    restartKey++
+                }
+            } catch (e: Exception) {
+                break
+            }
+        }
+    }
+
+    // Controls hide themselves after 5 seconds. Tap the screen to show them again.
+    LaunchedEffect(touchStamp, showControls) {
+        if (showControls) {
+            delay(5000)
+            showControls = false
         }
     }
 
@@ -255,6 +297,24 @@ fun PlayerScreen(
         }
     }
 
+    // Keeps the processor and Wi-Fi awake while playing, so it keeps going with the screen locked
+    DisposableEffect(Unit) {
+        val power = context.getSystemService(Context.POWER_SERVICE) as PowerManager
+        val cpuLock = power.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "leaniptv:play")
+        cpuLock.setReferenceCounted(false)
+        cpuLock.acquire()
+
+        val wifi = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+        val wifiLock = wifi.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "leaniptv:wifi")
+        wifiLock.setReferenceCounted(false)
+        wifiLock.acquire()
+
+        onDispose {
+            if (cpuLock.isHeld) cpuLock.release()
+            if (wifiLock.isHeld) wifiLock.release()
+        }
+    }
+
     // Keep the screen on while watching
     DisposableEffect(Unit) {
         val window = (context as? Activity)?.window
@@ -266,45 +326,106 @@ fun PlayerScreen(
         val found = liveSteps.indexOfFirst { it >= liveMs }
         val idx = if (found < 0) liveSteps.lastIndex else found
         liveMs = liveSteps[(idx + dir).coerceIn(0, liveSteps.lastIndex)]
-        prefs.edit().putInt("live_buf_ms_v3", liveMs).apply()
+        prefs.edit().putInt("live_buf_ms_v4", liveMs).apply()
+        errorCount = 0
+        restartKey++
     }
 
     fun stepMovie(dir: Int) {
-        resumeMs = player.currentPosition   // carry on from the same spot
+        try {
+            resumeMs = maxOf(session.mediaPlayer.time, 0L)   // carry on from the same spot
+        } catch (e: Exception) {
+            // ignore
+        }
         val found = movieSteps.indexOfFirst { it >= movieSec }
         val idx = if (found < 0) movieSteps.lastIndex else found
         movieSec = movieSteps[(idx + dir).coerceIn(0, movieSteps.lastIndex)]
         prefs.edit().putInt("movie_buf_s", movieSec).apply()
+        errorCount = 0
+        restartKey++
+    }
+
+    fun reconnect() {
+        errorCount = 0
+        if (!live) {
+            try {
+                resumeMs = maxOf(session.mediaPlayer.time, 0L)
+            } catch (e: Exception) {
+                // ignore
+            }
+        }
+        restartKey++
+    }
+
+    fun seekBy(deltaMs: Long) {
+        val mp = session.mediaPlayer
+        val len = mp.length
+        var target = maxOf(mp.time + deltaMs, 0L)
+        if (len > 2000) target = minOf(target, len - 1000)
+        mp.time = target
+    }
+
+    fun togglePlay() {
+        val mp = session.mediaPlayer
+        if (mp.isPlaying) {
+            session.userPaused = true
+            mp.pause()
+        } else {
+            session.userPaused = false
+            mp.play()
+        }
     }
 
     Box(Modifier.fillMaxSize().background(Color.Black)) {
         AndroidView(
             factory = { ctx ->
-                PlayerView(ctx).apply {
-                    resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
-                    setShowBuffering(PlayerView.SHOW_BUFFERING_ALWAYS)
+                VLCVideoLayout(ctx).also { layout ->
+                    session.mediaPlayer.attachViews(layout, null, false, false)
                 }
-            },
-            update = { view ->
-                view.player = player
-                view.useController = !live && !inPip
             },
             modifier = Modifier.fillMaxSize()
         )
 
-        // Live TV has no seek bar, so a tap shows or hides my own controls
-        if (live) {
-            Box(
-                Modifier
-                    .fillMaxSize()
-                    .pointerInput(Unit) {
-                        detectTapGestures { showLiveControls = !showLiveControls }
+        // A tap shows or hides the controls
+        Box(
+            Modifier
+                .fillMaxSize()
+                .pointerInput(Unit) {
+                    detectTapGestures {
+                        if (showControls) showControls = false else touch()
                     }
+                }
+        )
+
+        if (!inPip && errorCount == 0 && (!hasPlayed || bufferingPct < 100f)) {
+            Column(
+                Modifier.align(Alignment.Center),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                CircularProgressIndicator(color = Color.White)
+                Text(
+                    if (hasPlayed) "Buffering ${bufferingPct.toInt()}%" else "Connecting...",
+                    color = Color.Gray,
+                    fontSize = 12.sp,
+                    modifier = Modifier.padding(top = 8.dp)
+                )
+            }
+        }
+
+        if (!inPip && errorStamp != 0L && status.isNotEmpty()) {
+            Text(
+                status,
+                color = Color.Red,
+                fontSize = 13.sp,
+                modifier = Modifier
+                    .align(Alignment.Center)
+                    .background(Color(0xCC000000))
+                    .padding(12.dp)
             )
         }
 
-        // Title bar: live TV only, movies keep a clean picture
-        if (live && !inPip && showLiveControls) {
+        // Live TV: title bar and buffer controls
+        if (live && !inPip && showControls) {
             Column(
                 Modifier
                     .align(Alignment.TopCenter)
@@ -314,12 +435,10 @@ fun PlayerScreen(
             ) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text(title, color = Color.White, maxLines = 1, modifier = Modifier.weight(1f))
-                    TextButton(onClick = onEnterPip) { Text("PiP", color = Color.White) }
+                    TextButton(onClick = { touch(); onEnterPip() }) { Text("PiP", color = Color.White) }
                 }
             }
-        }
 
-        if (live && !inPip && showLiveControls) {
             Column(
                 Modifier
                     .align(Alignment.BottomCenter)
@@ -328,16 +447,11 @@ fun PlayerScreen(
                     .padding(8.dp),
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
-                Text(
-                    "Live buffer: ${liveMs / 1000.0} s",
-                    color = Color.White,
-                    fontSize = 13.sp
-                )
-                Text(liveInfo, color = Color.Yellow, fontSize = 11.sp)
+                Text("Live buffer: ${liveMs / 1000.0} s", color = Color.White, fontSize = 13.sp)
                 Row {
-                    TextButton(onClick = { stepLive(-1) }) { Text("Lower delay", color = Color.White) }
-                    TextButton(onClick = { stepLive(1) }) { Text("More stable", color = Color.White) }
-                    TextButton(onClick = { restart++ }) { Text("Reconnect", color = Color.White) }
+                    TextButton(onClick = { touch(); stepLive(-1) }) { Text("Lower delay", color = Color.White) }
+                    TextButton(onClick = { touch(); stepLive(1) }) { Text("More stable", color = Color.White) }
+                    TextButton(onClick = { touch(); reconnect() }) { Text("Reconnect", color = Color.White) }
                 }
                 Text(
                     "Lower = closer to live. Raise it if the picture stutters. Reconnect jumps back to live.",
@@ -347,16 +461,46 @@ fun PlayerScreen(
             }
         }
 
-        errorText?.let {
-            Text(
-                "Playback error\n$it",
-                color = Color.Red,
-                fontSize = 12.sp,
-                modifier = Modifier
-                    .align(Alignment.Center)
-                    .background(Color(0xCC000000))
-                    .padding(12.dp)
-            )
+        // Movies and series: seek bar and buttons, no banner over the picture
+        if (!live && !inPip && showControls) {
+            Column(
+                Modifier
+                    .align(Alignment.BottomCenter)
+                    .fillMaxWidth()
+                    .background(Color(0x99000000))
+                    .padding(8.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    TextButton(onClick = { touch(); stepMovie(-1) }) { Text("Less buffer", color = Color.White) }
+                    Text("Buffer: $movieSec s", color = Color.White, fontSize = 12.sp)
+                    TextButton(onClick = { touch(); stepMovie(1) }) { Text("More buffer", color = Color.White) }
+                    TextButton(onClick = { touch(); onEnterPip() }) { Text("PiP", color = Color.White) }
+                }
+                Slider(
+                    value = progress.coerceIn(0f, 1f),
+                    onValueChange = {
+                        progress = it
+                        scrubbing = true
+                        touchStamp++
+                    },
+                    onValueChangeFinished = {
+                        session.mediaPlayer.position = progress
+                        scrubbing = false
+                    }
+                )
+                Row(Modifier.fillMaxWidth()) {
+                    Text(clock(timeMs), color = Color.White, fontSize = 12.sp, modifier = Modifier.weight(1f))
+                    Text(clock(lengthMs), color = Color.White, fontSize = 12.sp)
+                }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    TextButton(onClick = { touch(); seekBy(-30_000L) }) { Text("-30 s", color = Color.White) }
+                    TextButton(onClick = { touch(); togglePlay() }) {
+                        Text(if (playing) "Pause" else "Play", color = Color.White)
+                    }
+                    TextButton(onClick = { touch(); seekBy(30_000L) }) { Text("+30 s", color = Color.White) }
+                }
+            }
         }
     }
 }
