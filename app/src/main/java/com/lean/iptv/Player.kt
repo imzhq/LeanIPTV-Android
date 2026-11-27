@@ -2,6 +2,7 @@ package com.lean.iptv
 
 import android.app.Activity
 import android.content.Context
+import android.content.ContextWrapper
 import android.content.Intent
 import android.net.Uri
 import android.net.wifi.WifiManager
@@ -25,6 +26,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
@@ -72,10 +74,20 @@ private fun clock(ms: Long): String {
     return if (h > 0) String.format("%d:%02d:%02d", h, m, sec) else String.format("%d:%02d", m, sec)
 }
 
-// Remembers the video view and whether the player is currently attached to it
+private fun Context.findComponentActivity(): ComponentActivity? {
+    var c: Context = this
+    while (c is ContextWrapper) {
+        if (c is ComponentActivity) return c
+        c = c.baseContext
+    }
+    return null
+}
+
+// Remembers the video view and whether the screen was stopped (for example, locked)
 private class ViewState {
     var layout: VLCVideoLayout? = null
     var attached = false
+    var stopped = false
 }
 
 // One VLC player for the whole screen. Reconnecting reuses it, so the old connection closes first.
@@ -154,6 +166,7 @@ fun PlayerScreen(
 
     var liveMs by remember { mutableIntStateOf(prefs.getInt("live_buf_ms_v4", 500)) }
     var restartKey by remember { mutableIntStateOf(0) }
+    var layoutKey by remember { mutableIntStateOf(0) }
     var resumeMs by remember { mutableLongStateOf(0L) }
     var hasPlayed by remember { mutableStateOf(false) }
     var bufferingPct by remember { mutableFloatStateOf(100f) }
@@ -208,14 +221,15 @@ fun PlayerScreen(
         }
     }
 
-    // Fixes the black picture after locking the phone: let go of the video view when the screen
-    // stops (the sound keeps playing), and attach it again when the app comes back
+    // Screen lock. When the screen stops, Android destroys the surface the video is drawn on.
+    // VLC does not rebuild its video output by itself, so on unlock we build a fresh video view.
     DisposableEffect(session) {
-        val owner = context as? ComponentActivity
+        val owner = context.findComponentActivity()
         val observer = LifecycleEventObserver { _, event ->
             if (!session.released) {
                 when (event) {
                     Lifecycle.Event.ON_STOP -> {
+                        viewState.stopped = true
                         if (viewState.attached) {
                             try {
                                 session.mediaPlayer.detachViews()
@@ -226,14 +240,10 @@ fun PlayerScreen(
                         }
                     }
                     Lifecycle.Event.ON_START -> {
-                        val layout = viewState.layout
-                        if (layout != null && !viewState.attached) {
-                            try {
-                                session.mediaPlayer.attachViews(layout, null, false, false)
-                                viewState.attached = true
-                            } catch (e: Exception) {
-                                // ignore
-                            }
+                        // Only after a real stop, not when the screen first opens
+                        if (viewState.stopped) {
+                            viewState.stopped = false
+                            layoutKey++
                         }
                     }
                     else -> {}
@@ -242,6 +252,26 @@ fun PlayerScreen(
         }
         owner?.lifecycle?.addObserver(observer)
         onDispose { owner?.lifecycle?.removeObserver(observer) }
+    }
+
+    // After unlocking: give the new video view a moment to attach, then restart the stream.
+    // Movies continue from the same spot, live TV jumps back to the live edge.
+    LaunchedEffect(layoutKey) {
+        if (layoutKey > 0) {
+            delay(500)
+            if (!session.released) {
+                if (!live) {
+                    try {
+                        val t = session.mediaPlayer.time
+                        if (t > 0) resumeMs = t
+                    } catch (e: Exception) {
+                        // ignore
+                    }
+                }
+                errorCount = 0
+                restartKey++
+            }
+        }
     }
 
     // Starts playback, and restarts it whenever restartKey changes (reconnect, buffer change, recovery)
@@ -410,16 +440,23 @@ fun PlayerScreen(
     }
 
     Box(Modifier.fillMaxSize().background(Color.Black)) {
-        AndroidView(
-            factory = { ctx ->
-                VLCVideoLayout(ctx).also { layout ->
-                    viewState.layout = layout
-                    session.mediaPlayer.attachViews(layout, null, false, false)
-                    viewState.attached = true
-                }
-            },
-            modifier = Modifier.fillMaxSize()
-        )
+        // A new key builds a new video view, which is what fixes the black picture after unlocking
+        key(layoutKey) {
+            AndroidView(
+                factory = { ctx ->
+                    VLCVideoLayout(ctx).also { layout ->
+                        viewState.layout = layout
+                        try {
+                            session.mediaPlayer.attachViews(layout, null, false, false)
+                            viewState.attached = true
+                        } catch (e: Exception) {
+                            viewState.attached = false
+                        }
+                    }
+                },
+                modifier = Modifier.fillMaxSize()
+            )
+        }
 
         // A tap shows or hides the controls
         Box(
