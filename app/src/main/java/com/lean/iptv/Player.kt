@@ -26,6 +26,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
@@ -42,7 +43,9 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
 import org.videolan.libvlc.LibVLC
 import org.videolan.libvlc.Media
 import org.videolan.libvlc.MediaPlayer
@@ -57,8 +60,8 @@ object PlayerHolder {
     var player: PlayerControl? = null
 }
 
-private val liveSteps = listOf(800, 1500, 2500, 4000, 5000, 6000, 7000) // milliseconds
-private const val MOVIE_BUFFER_S = 25
+private val liveSteps = listOf(300, 500, 800, 1200, 2000, 3000, 5000)   // milliseconds
+private const val MOVIE_BUFFER_S = 20
 
 private fun clock(ms: Long): String {
     val s = maxOf(ms, 0L) / 1000
@@ -84,13 +87,7 @@ private class ViewState {
 }
 
 private class VlcSession(context: Context) : PlayerControl {
-    val libVlc = LibVLC(
-        context.applicationContext,
-        arrayListOf(
-            "--http-reconnect",
-            "--audio-language=eng,en"
-        )
-    )
+    val libVlc = LibVLC(context.applicationContext, arrayListOf("--http-reconnect"))
     val mediaPlayer = MediaPlayer(libVlc)
 
     @Volatile
@@ -107,39 +104,17 @@ private class VlcSession(context: Context) : PlayerControl {
         }
     }
 
-    fun attachTo(layout: VLCVideoLayout) {
-        if (released) return
-        try {
-            mediaPlayer.detachViews()
-        } catch (_: Exception) {
-        }
-        try {
-            mediaPlayer.attachViews(layout, null, false, false)
-        } catch (_: Exception) {
-        }
-    }
-
     fun start(url: String, live: Boolean, bufferMs: Int, startSec: Int) {
-        if (released) return
         userPaused = false
-        try {
-            mediaPlayer.stop()
-        } catch (_: Exception) {
+        val media = Media(libVlc, Uri.parse(url))
+        media.addOption(":network-caching=$bufferMs")
+        if (live) {
+            media.addOption(":live-caching=$bufferMs")
+        } else {
+            media.addOption(":file-caching=$bufferMs")
+            if (startSec > 0) media.addOption(":start-time=$startSec")
         }
-
-        val media = Media(libVlc, Uri.parse(url)).apply {
-            setHWDecoderEnabled(true, false)
-            addOption(":network-caching=$bufferMs")
-            addOption(":http-reconnect")
-            addOption(":http-user-agent=Mozilla/5.0")
-            addOption(":audio-language=eng,en")
-            if (live) {
-                addOption(":live-caching=$bufferMs")
-            } else {
-                addOption(":file-caching=$bufferMs")
-                if (startSec > 0) addOption(":start-time=$startSec")
-            }
-        }
+        media.addOption(":http-reconnect")
         mediaPlayer.media = media
         media.release()
         mediaPlayer.play()
@@ -174,11 +149,12 @@ fun PlayerScreen(
 ) {
     val context = LocalContext.current
     val prefs = remember { context.getSharedPreferences("lean", Context.MODE_PRIVATE) }
-    val session = remember(url) { VlcSession(context) }
-    val viewState = remember(url) { ViewState() }
+    val session = remember { VlcSession(context) }
+    val viewState = remember { ViewState() }
 
-    var liveMs by remember { mutableIntStateOf(prefs.getInt("live_buf_ms_v5", 5000)) }
+    var liveMs by remember { mutableIntStateOf(prefs.getInt("live_buf_ms_v4", 800)) }
     var restartKey by remember { mutableIntStateOf(0) }
+    var layoutKey by remember { mutableIntStateOf(0) }
     var resumeMs by remember { mutableLongStateOf(0L) }
     var hasPlayed by remember { mutableStateOf(false) }
     var bufferingPct by remember { mutableFloatStateOf(100f) }
@@ -232,59 +208,64 @@ fun PlayerScreen(
         }
     }
 
-    // Re-attach VLC video output on unlock / PiP return without tearing down the view hierarchy
     DisposableEffect(session) {
         val owner = context.findComponentActivity()
         val observer = LifecycleEventObserver { _, event ->
-            if (session.released) return@LifecycleEventObserver
-            when (event) {
-                Lifecycle.Event.ON_STOP -> {
-                    viewState.stopped = true
-                }
-                Lifecycle.Event.ON_START -> {
-                    val layout = viewState.layout
-                    if (layout != null) {
-                        session.attachTo(layout)
-                        viewState.attached = true
-                    }
-                    if (viewState.stopped) {
-                        viewState.stopped = false
-                        if (!live) {
+            if (!session.released) {
+                when (event) {
+                    Lifecycle.Event.ON_STOP -> {
+                        viewState.stopped = true
+                        if (viewState.attached) {
                             try {
-                                val t = session.mediaPlayer.time
-                                if (t > 0) resumeMs = t
+                                session.mediaPlayer.detachViews()
                             } catch (_: Exception) {
                             }
-                        }
-                        if (!session.userPaused) {
-                            try {
-                                session.mediaPlayer.play()
-                            } catch (_: Exception) {
-                            }
+                            viewState.attached = false
                         }
                     }
+                    Lifecycle.Event.ON_START -> {
+                        if (viewState.stopped) {
+                            viewState.stopped = false
+                            layoutKey++
+                        }
+                    }
+                    else -> {}
                 }
-                else -> {}
             }
         }
         owner?.lifecycle?.addObserver(observer)
         onDispose { owner?.lifecycle?.removeObserver(observer) }
     }
 
-    // Ensure view stays attached when entering/exiting PiP
-    LaunchedEffect(inPip) {
-        val layout = viewState.layout
-        if (layout != null && !session.released) {
-            delay(150)
-            session.attachTo(layout)
-            viewState.attached = true
+    LaunchedEffect(layoutKey) {
+        if (layoutKey > 0) {
+            delay(500)
+            if (!session.released) {
+                if (!live) {
+                    try {
+                        val t = session.mediaPlayer.time
+                        if (t > 0) resumeMs = t
+                    } catch (_: Exception) {
+                    }
+                }
+                errorCount = 0
+                restartKey++
+            }
         }
     }
 
-    LaunchedEffect(url, liveMs, restartKey) {
+    LaunchedEffect(restartKey) {
+        if (restartKey > 0) {
+            withContext(Dispatchers.IO) {
+                try {
+                    session.mediaPlayer.stop()
+                } catch (_: Exception) {
+                }
+            }
+            delay(600)
+        }
         if (session.released) return@LaunchedEffect
         hasPlayed = false
-        bufferingPct = 0f
         val bufferMs = if (live) liveMs else MOVIE_BUFFER_S * 1000
         val startSec = if (live) 0 else (resumeMs / 1000).toInt()
         session.start(url, live, bufferMs, startSec)
@@ -293,7 +274,7 @@ fun PlayerScreen(
     LaunchedEffect(errorStamp) {
         if (errorStamp != 0L) {
             if (errorCount < 5) {
-                delay(2500)
+                delay(3000)
                 errorCount++
                 if (!live) {
                     try {
@@ -304,7 +285,7 @@ fun PlayerScreen(
                 }
                 restartKey++
             } else {
-                status = "Playback failed. Tap Reconnect or check if another device is using the account."
+                status = "Playback failed. Try Reconnect, and check that no other device is using the account."
             }
         }
     }
@@ -391,7 +372,7 @@ fun PlayerScreen(
         val found = liveSteps.indexOfFirst { it >= liveMs }
         val idx = if (found < 0) liveSteps.lastIndex else found
         liveMs = liveSteps[(idx + dir).coerceIn(0, liveSteps.lastIndex)]
-        prefs.edit().putInt("live_buf_ms_v5", liveMs).apply()
+        prefs.edit().putInt("live_buf_ms_v4", liveMs).apply()
         errorCount = 0
         restartKey++
     }
@@ -427,23 +408,22 @@ fun PlayerScreen(
     }
 
     Box(Modifier.fillMaxSize().background(Color.Black)) {
-        AndroidView(
-            factory = { ctx ->
-                VLCVideoLayout(ctx).also { layout ->
-                    viewState.layout = layout
-                    session.attachTo(layout)
-                    viewState.attached = true
-                }
-            },
-            update = { layout ->
-                viewState.layout = layout
-                if (!viewState.attached) {
-                    session.attachTo(layout)
-                    viewState.attached = true
-                }
-            },
-            modifier = Modifier.fillMaxSize()
-        )
+        key(layoutKey) {
+            AndroidView(
+                factory = { ctx ->
+                    VLCVideoLayout(ctx).also { layout ->
+                        viewState.layout = layout
+                        try {
+                            session.mediaPlayer.attachViews(layout, null, false, false)
+                            viewState.attached = true
+                        } catch (_: Exception) {
+                            viewState.attached = false
+                        }
+                    }
+                },
+                modifier = Modifier.fillMaxSize()
+            )
+        }
 
         Box(
             Modifier
